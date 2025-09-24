@@ -1,3 +1,10 @@
+""" 
+
+This code was taken from the Github Repo: https://github.com/hoangthangta/All-KAN/blob/main/run_ff.py
+
+and edited for new W-CSRBF Models and regularizers
+
+"""
 import argparse, os, time, types
 import numpy as np
 import matplotlib.pyplot as plt

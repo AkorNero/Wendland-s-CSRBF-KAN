@@ -1,3 +1,9 @@
+""" 
+This code was taken from the Github Repo: https://github.com/hoangthangta/FC_KAN/blob/main/run.py
+
+and edited for new W-CSRBF Models and regularizers
+
+"""
 import argparse
 import os
 import random

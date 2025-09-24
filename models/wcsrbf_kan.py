@@ -28,7 +28,12 @@ class WendlandCSRBF(nn.Module):
     Options:
       - trainable_centers (bool)
       - trainable_sigma   (bool)
-      - reset_centers_sigma_from_data(x, grid_eps) mixes uniform and adaptive (quantile) grids from data.
+      - sigma is a direct positive parameter (no softplus); clamped in sigma()
+      - centers initialized uniformly in `center_range`
+      - sigma initialized from uniform grid spacing (or `init_sigma` if M=1)
+
+    Plus:
+      - reset_centers_sigma_from_data(x, grid_eps, ...) mixes uniform and adaptive (quantile) grids from data.
     """
     def __init__(
         self,
@@ -39,7 +44,7 @@ class WendlandCSRBF(nn.Module):
         per_feature_centers=True,
         trainable_centers=True,
         trainable_sigma=True,
-        init_sigma=1.0,    
+        init_sigma=1.0,     # used when n_centers == 1
         min_sigma=1e-3,
         s_scale=1.0,        # sigma ≈ s_scale * (uniform grid spacing)
     ):
@@ -52,7 +57,7 @@ class WendlandCSRBF(nn.Module):
         self._center_range = tuple(center_range)
         self._per_feature_centers = bool(per_feature_centers)
 
-        # uniform centers
+        # ---- uniform centers in center_range ----
         lo, hi = self._center_range
         uni = torch.linspace(lo, hi, self.n_centers).unsqueeze(0)  # (1, M)
         if self._per_feature_centers:
@@ -61,7 +66,7 @@ class WendlandCSRBF(nn.Module):
         # centers parameter (trainable or frozen)
         self.centers = nn.Parameter(uni, requires_grad=bool(trainable_centers))
 
-        # sigma parameter (trainable or frozen)
+        # ---- sigma parameter (direct positive param; no softplus) ----
         if self.n_centers > 1:
             # uniform grid spacing
             step = (hi - lo) / (self.n_centers - 1)
@@ -75,11 +80,11 @@ class WendlandCSRBF(nn.Module):
     @torch.no_grad()
     def reset_centers_sigma_from_data(
         self,
-        x,                     # (N, D)
+        x,                     # (N, D) data already in THIS block's space (apply LN outside if you use LN)
         grid_eps=0.5,          # mix weight: eps*uniform + (1-eps)*adaptive
         low_q=0.01,
         high_q=0.99,
-        s_scale=None          # optional override
+        s_scale=None          # optional override for sigma scaling based on spacing
     ):
         """
         Reinitialize centers & sigma from data using a mix:
@@ -116,6 +121,7 @@ class WendlandCSRBF(nn.Module):
 
         sigma = sigma.clamp_min(self.min_sigma)
 
+        # match parameter shapes/dev/dtype
         dev, dt = self.centers.device, self.centers.dtype
         if self.centers.shape[0] == 1:  # per_feature_centers=False --> broadcasted centers
             centers_mix = centers_mix.mean(dim=0, keepdim=True)
@@ -138,9 +144,13 @@ class WendlandCSRBF(nn.Module):
     
 class WCSRBFKANLayer(nn.Module):
     """
-    Optional SiLU + WCSRBF edge:
-        use_base=True  -> y = Linear(SiLU(norm(x)); no bias) + Linear(phi(norm(x)); no bias)
-        use_base=False -> y =                                         Linear(phi(norm(x)); with bias)
+    y = (Linear(SiLU(norm(x))) ⊙ Wb_post) + (Linear(phi(norm(x))) ⊙ Ws_post)
+
+    Options:
+      - enable_layer_norm (bool)
+      - post_mix_mode: "per_out" (vector) or "scalar" (global)
+      - CSRBF block with trainable/frozen centers & sigma
+      - data-based grid reset helper (handles LN inside)
     """
     def __init__(
         self,
@@ -149,8 +159,7 @@ class WCSRBFKANLayer(nn.Module):
         n_centers=8,
         k=2,
         enable_layer_norm=True,
-        use_base=True,                
-        base_activation=F.silu,
+        post_mix_mode="per_out",
         center_range=(-2.0, 2.0),
         per_feature_centers=True,
         trainable_centers=True,
@@ -160,21 +169,19 @@ class WCSRBFKANLayer(nn.Module):
         s_scale=1.0,
     ):
         super().__init__()
-        self.in_features  = int(in_features)
+        self.in_features = int(in_features)
         self.out_features = int(out_features)
+        self.post_mix_mode = post_mix_mode
         self.enable_layer_norm = bool(enable_layer_norm)
-        self.use_base = bool(use_base)
-        self.base_activation = base_activation
 
         self.layernorm = nn.LayerNorm(self.in_features) if self.enable_layer_norm else nn.Identity()
 
-        if self.use_base:
-            self.base_weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
-            nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5))
-        else:
-            self.register_parameter("base_weight", None)
+        # base (SiLU) linear
+        self.base_weight = nn.Parameter(torch.empty(self.out_features, self.in_features))
+        # nn.init.kaiming_uniform_(self.base_weight, a=math.sqrt(5))
+        nn.init.xavier_uniform_(self.base_weight)
 
-        # --- WCSRBF path ---
+        # CSRBF features + linear
         self.csrbf = WendlandCSRBF(
             self.in_features, n_centers=n_centers, k=k,
             center_range=center_range,
@@ -188,13 +195,22 @@ class WCSRBFKANLayer(nn.Module):
         self.spline_weight = nn.Parameter(torch.empty(self.out_features, self.in_features * n_centers))
         nn.init.xavier_uniform_(self.spline_weight)
 
-        if not self.use_base:
-            self.spline_bias = nn.Parameter(torch.zeros(self.out_features))
+        # post-mix weights
+        if post_mix_mode == "per_out":
+            self.Wb_post = nn.Parameter(torch.ones(self.out_features))
+            self.Ws_post = nn.Parameter(torch.ones(self.out_features))
+        elif post_mix_mode == "scalar":
+            self.Wb_post = nn.Parameter(torch.tensor(1.0))
+            self.Ws_post = nn.Parameter(torch.tensor(1.0))
         else:
-            self.register_parameter("spline_bias", None)
+            raise ValueError("post_mix_mode must be 'per_out' or 'scalar'")
 
     @torch.no_grad()
     def init_wcsrbf_grid(self, x_sample, grid_eps=0.5, low_q=0.01, high_q=0.99, s_scale=None):
+        """
+        Convenience wrapper: reinitialize centers & sigma from a data minibatch.
+        If LayerNorm is enabled, apply it before passing to CSRBF reset.
+        """
         z = self.layernorm(x_sample) if self.enable_layer_norm else x_sample
         self.csrbf.reset_centers_sigma_from_data(
             z, grid_eps=float(grid_eps), low_q=low_q, high_q=high_q, s_scale=s_scale
@@ -202,44 +218,43 @@ class WCSRBFKANLayer(nn.Module):
 
     def forward(self, x):
         z = self.layernorm(x)
-        phi = self.csrbf(z)  # (B, D*M)
-        spline = F.linear(phi, self.spline_weight,
-                          self.spline_bias if self.spline_bias is not None else None)
+        base = F.linear(F.silu(z), self.base_weight)           # (B, O)
+        phi  = self.csrbf(z)                                   # (B, D*M)
+        spline = F.linear(phi, self.spline_weight)             # (B, O)
 
-        if self.base_weight is not None:
-            base_in = self.base_activation(z) if self.base_activation is not None else z
-            base = F.linear(base_in, self.base_weight) 
-            return base + spline
+        if self.post_mix_mode == "per_out":
+            y = base * self.Wb_post.view(1, -1) + spline * self.Ws_post.view(1, -1)
         else:
-            return spline
-
-
+            y = base * self.Wb_post + spline * self.Ws_post
+        return y
 
 class WCSRBFKAN(nn.Module):
+    """
+    dims: [D_in, H1, ..., D_out]
+    """
     def __init__(
         self,
         dims,
         n_centers=8,
         k=2,
         enable_layer_norm=True,
-        use_base=True,                
-        base_activation=F.silu,       
-        center_range=(-2.0, 2.0),
-        per_feature_centers=True,
         trainable_centers=True,
         trainable_sigma=True,
+        post_mix_mode="per_out",
+        center_range=(-2.0, 2.0),
+        per_feature_centers=True,
         init_sigma=1.0,
         min_sigma=1e-3,
         s_scale=1.0,
-        grid_eps=1.0
+        grid_eps = 1.0
     ):
         super().__init__()
         self.dims = list(dims)
         L = len(self.dims) - 1
-        assert 0.0 <= grid_eps <= 1.0
-        self.grid_eps = float(grid_eps)
-        self.trainable_centers = trainable_centers
-        self.trainable_sigma = trainable_sigma
+
+        assert grid_eps >= 0 and grid_eps <= 1
+
+        self.grid_eps = grid_eps
 
         def to_list(v):
             return v if isinstance(v, (list, tuple)) else [v] * L
@@ -247,7 +262,9 @@ class WCSRBFKAN(nn.Module):
         n_centers_list = to_list(n_centers)
         k_list = to_list(k)
         ln_list = to_list(enable_layer_norm)
-        ub_list = to_list(use_base)
+        pm_list = to_list(post_mix_mode)
+        self.trainable_sigma = trainable_sigma
+        self.trainable_centers = trainable_centers
 
         layers = []
         for i in range(L):
@@ -259,8 +276,7 @@ class WCSRBFKAN(nn.Module):
                     n_centers=int(n_centers_list[i]),
                     k=int(k_list[i]),
                     enable_layer_norm=bool(ln_list[i]),
-                    use_base=bool(ub_list[i]),                 
-                    base_activation=base_activation,          
+                    post_mix_mode=str(pm_list[i]),
                     center_range=center_range,
                     per_feature_centers=per_feature_centers,
                     trainable_centers=trainable_centers,
@@ -273,26 +289,47 @@ class WCSRBFKAN(nn.Module):
         self.layers = nn.ModuleList(layers)
 
     def sigma_inverse_l2(self, lambda_sigma=1e-3, eps=1e-8, squared=True):
+        """
+        L2 penalty on the inverse of sigma.
+        squared=True  ->  sum_i (1 / sigma_i)^2       (squared L2, typical)
+        squared=False ->  || 1 / sigma ||_2           (true L2 norm)
+
+        Uses a smooth, positive surrogate for sigma so gradients don't vanish
+        at the clamp floor used in forward().
+        """
         reg = 0.0
         for layer in self.layers:
             s_raw = layer.csrbf.sigma_param
             s_min = layer.csrbf.min_sigma
+            # smooth lower bound: > s_min and differentiable
             s_safe = F.softplus(s_raw - s_min) + s_min
             inv = 1.0 / (s_safe + eps)
-            reg = reg + ((inv * inv).sum() if squared else torch.linalg.norm(inv, 2))
-        return lambda_sigma * reg
 
-    def weights_l2(model, lambda_w=1e-4, lambda_b=None):
-        if lambda_b is None:
-            lambda_b = lambda_w
-        reg_w, reg_b = 0.0, 0.0
+            if squared:
+                reg = reg + (inv * inv).sum()          # squared L2 on inverse
+            else:
+                reg = reg + torch.linalg.norm(inv, 2)  # true L2 norm
+        return lambda_sigma * reg
+    
+    def centers_l2(self, lambda_c=1e-5):
+        return lambda_c * sum((l.csrbf.centers.pow(2).sum() for l in self.layers))
+
+    def weights_l2(model, lambda_w=1e-4):
+        """
+        L2 on base/spline weights + (optionally) post-mix scalars/vectors.
+        lambda_w     : coeff for base_weight & spline_weight
+        """
+
+        reg_w = 0.0
+        reg_post = 0.0
         for l in model.layers:
-            if getattr(l, "base_weight", None) is not None:
-                reg_w += l.base_weight.pow(2).sum()
-            reg_w += l.spline_weight.pow(2).sum()
-            if getattr(l, "spline_bias", None) is not None:
-                reg_b += l.spline_bias.pow(2).sum()
-        return lambda_w * reg_w + lambda_b * reg_b
+            # linear weights
+            reg_w += l.base_weight.pow(2).sum() + l.spline_weight.pow(2).sum()
+            # post-mix (exists for both 'per_out' and 'scalar' modes)
+            reg_post += l.Wb_post.pow(2).sum() + l.Ws_post.pow(2).sum()
+
+        return lambda_w * (reg_w + reg_post)
+
 
 
     @property
@@ -313,6 +350,6 @@ class WCSRBFKAN(nn.Module):
     def forward(self, x):
         for layer in self.layers:
             if self.grid_eps != 1:
-                layer.init_wcsrbf_grid(x, grid_eps=self.grid_eps)
+                layer.init_wcsrbf_grid(x, grid_eps = self.grid_eps)
             x = layer(x)
         return x
