@@ -19,7 +19,7 @@ import requests
 
 #import numpy as np
 from file_io import *
-from models import EfficientKAN, FastKAN, BSRBF_KAN, FasterKAN, MLP, FC_KAN, WCSRBFKAN, KAN, WCSRBFKAN
+from models import EfficientKAN, FastKAN, BSRBF_KAN, FasterKAN, MLP, FC_KAN, WCSRBFKAN, WCSRBFKAN, WCSRBFKANSolo
 from kan.utils import create_dataset_from_data
 
 from pathlib import Path
@@ -209,8 +209,6 @@ def run(args):
         model = WCSRBFKANSolo(dims=[args.n_input, args.n_hidden, args.n_output], n_centers = args.num_grids, enable_layer_norm=False, trainable_centers=True, trainable_sigma=True, use_base=False)
     elif(args.model_name == 'mlp'):
         model = MLP([args.n_input, args.n_hidden, args.n_output], layernorm=False)
-    elif(args.model_name == 'mlp_class'):
-        model = MLPClassification([args.n_input, args.n_hidden, args.n_output], layernorm=False)
     elif(args.model_name == 'fc_kan'):
         model = FC_KAN([args.n_input, args.n_hidden, args.n_output], args.func_list, combined_type = args.combined_type, grid_size = args.grid_size, spline_order = args.spline_order, drop_out = args.drop_out, layernorm=False)
     elif(args.model_name == 'efficient_kan'):
@@ -242,9 +240,10 @@ def run(args):
                     output = model(images.to(device))
                     loss = criterion(output, labels.to(device))
                     if "wcsrbf" in args.model_name:
-                        if model.trainable_sigma_bool:
-                            loss += model.sigma_inverse_l2(0.001)
-                        loss += model.weights_l2(0.001)
+                    #     if model.trainable_sigma_bool:
+                    #         loss += model.sigma_inverse_l2(0.001)
+                        # loss += model.weights_l2(0.001)
+                        pass
                     else:
                         loss += weights_l2(args.model_name, model, 0.001)
 
